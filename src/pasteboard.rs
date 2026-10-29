@@ -10,7 +10,7 @@ use cocoa::{
     base::{id, nil},
     foundation::{NSArray, NSData, NSFastEnumeration, NSString},
 };
-use objc::{msg_send, rc::StrongPtr, runtime::Object, sel, sel_impl};
+use objc::{class, msg_send, rc::StrongPtr, runtime::Object, sel, sel_impl};
 use smallvec::SmallVec;
 use strum::IntoEnumIterator as _;
 
@@ -50,8 +50,8 @@ impl Pasteboard {
     }
 
     pub fn read(&self) -> Option<ClipboardItem> {
+        let mut entries = Vec::new();
         unsafe {
-            // Check for file paths first
             let filenames = NSPasteboard::propertyListForType(*self.inner, NSFilenamesPboardType);
             if filenames != nil && NSArray::count(filenames) > 0 {
                 let mut paths = SmallVec::new();
@@ -60,38 +60,16 @@ impl Pasteboard {
                     let path = CStr::from_ptr(f).to_string_lossy().into_owned();
                     paths.push(PathBuf::from(path));
                 }
-                if !paths.is_empty() {
-                    let mut entries = vec![ClipboardEntry::ExternalPaths(ExternalPaths(paths))];
-
-                    // Also include the string representation so text editors can
-                    // paste the path as text.
-                    if let Some(string_item) = self.read_string_from_pasteboard() {
-                        entries.push(string_item);
-                    }
-
-                    return Some(ClipboardItem { entries });
-                }
+                entries.push(ClipboardEntry::ExternalPaths(ExternalPaths(paths)));
             }
-
-            // Next, check for a plain string.
-            if let Some(string_entry) = self.read_string_from_pasteboard() {
-                return Some(ClipboardItem {
-                    entries: vec![string_entry],
-                });
-            }
-
-            // Finally, try the various supported image types.
-            for format in ImageFormat::iter() {
-                if let Some(item) = self.read_image(format) {
-                    return Some(item);
-                }
-            }
+            entries.extend(self.read_string_from_pasteboard());
         }
-
-        None
+        // The first image format it holds, as gpui orders them.
+        entries.extend(ImageFormat::iter().find_map(|format| self.read_image(format)));
+        (!entries.is_empty()).then_some(ClipboardItem { entries })
     }
 
-    fn read_image(&self, format: ImageFormat) -> Option<ClipboardItem> {
+    fn read_image(&self, format: ImageFormat) -> Option<ClipboardEntry> {
         let ut_type: UTType = format.into();
 
         unsafe {
@@ -101,9 +79,7 @@ impl Pasteboard {
                     let bytes = bytes.to_vec();
                     let id = hash(&bytes);
 
-                    ClipboardItem {
-                        entries: vec![ClipboardEntry::Image(Image { format, bytes, id })],
-                    }
+                    ClipboardEntry::Image(Image { format, bytes, id })
                 })
             } else {
                 None
@@ -157,54 +133,52 @@ impl Pasteboard {
     }
 
     pub fn write(&self, item: ClipboardItem) {
+        // Files first, each its own item; text and images join the first.
+        let mut text: Option<ClipboardString> = None;
         unsafe {
-            match item.entries.as_slice() {
-                [] => {
-                    // Writing an empty list of entries just clears the clipboard.
-                    self.inner.clearContents();
-                }
-                [ClipboardEntry::String(string)] => {
-                    self.write_plaintext(string);
-                }
-                [ClipboardEntry::Image(image)] => {
-                    self.write_image(image);
-                }
-                [ClipboardEntry::ExternalPaths(_)] => {}
-                _ => {
-                    // Agus NB: We're currently only writing string entries to the clipboard when we have more than one.
-                    //
-                    // This was the existing behavior before I refactored the outer clipboard code:
-                    // https://github.com/zed-industries/zed/blob/65f7412a0265552b06ce122655369d6cc7381dd6/crates/gpui/src/platform/mac/platform.rs#L1060-L1110
-                    //
-                    // Note how `any_images` is always `false`. We should fix that, but that's orthogonal to the refactor.
-
-                    let mut combined = ClipboardString {
-                        text: String::new(),
-                        metadata: None,
-                    };
-
-                    for entry in item.entries {
-                        match entry {
-                            ClipboardEntry::String(text) => {
-                                combined.text.push_str(&text.text());
-                                if combined.metadata.is_none() {
-                                    combined.metadata = text.metadata;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    self.write_plaintext(&combined);
+            self.inner.clearContents();
+            for entry in &item.entries {
+                if let ClipboardEntry::ExternalPaths(paths) = entry {
+                    self.write_paths(paths);
                 }
             }
+            for entry in item.entries {
+                match entry {
+                    // Strings join as one, keeping the first metadata.
+                    ClipboardEntry::String(string) => match &mut text {
+                        Some(joined) => {
+                            joined.text.push_str(&string.text);
+                            joined.metadata = joined.metadata.take().or(string.metadata);
+                        }
+                        None => text = Some(string),
+                    },
+                    ClipboardEntry::Image(image) => self.write_image(&image),
+                    ClipboardEntry::ExternalPaths(_) => {}
+                }
+            }
+            if let Some(text) = text {
+                self.write_plaintext(&text);
+            }
+        }
+    }
+
+    unsafe fn write_paths(&self, paths: &ExternalPaths) {
+        unsafe {
+            let urls: Vec<id> = paths
+                .paths()
+                .iter()
+                .map(|path| {
+                    let path = ns_string(&path.to_string_lossy());
+                    msg_send![class!(NSURL), fileURLWithPath: path]
+                })
+                .collect();
+            let urls = NSArray::arrayWithObjects(nil, &urls);
+            let _: bool = msg_send![*self.inner, writeObjects: urls];
         }
     }
 
     fn write_plaintext(&self, string: &ClipboardString) {
         unsafe {
-            self.inner.clearContents();
-
             let text_bytes = NSData::dataWithBytes_length_(
                 nil,
                 string.text.as_ptr() as *const c_void,
@@ -235,8 +209,6 @@ impl Pasteboard {
 
     unsafe fn write_image(&self, image: &Image) {
         unsafe {
-            self.inner.clearContents();
-
             let bytes = NSData::dataWithBytes_length_(
                 nil,
                 image.bytes.as_ptr() as *const c_void,
@@ -402,6 +374,30 @@ mod tests {
             pasteboard.read(),
             Some(ClipboardItem::new_string(text_from_other_app.to_string()))
         );
+    }
+
+    #[test]
+    fn text_an_image_and_files_write_and_read_together() {
+        let pasteboard = Pasteboard::unique();
+        let text = ClipboardEntry::String(ClipboardString::new("two files".to_string()));
+        let image = ClipboardEntry::Image(Image::from_bytes(ImageFormat::Png, vec![1, 2, 3]));
+        let paths = ClipboardEntry::ExternalPaths(ExternalPaths(SmallVec::from_vec(vec![
+            PathBuf::from("/tmp/a b.txt"),
+            PathBuf::from("/tmp/c.txt"),
+        ])));
+        let entries = vec![text.clone(), image.clone(), paths.clone()];
+        pasteboard.write(ClipboardItem { entries });
+        let read = pasteboard.read().expect("an item").entries;
+        assert_eq!(read, [paths.clone(), text, image.clone()]);
+
+        pasteboard.write(ClipboardItem {
+            entries: vec![paths.clone()],
+        });
+        assert_eq!(pasteboard.read().expect("files").entries[0], paths);
+        pasteboard.write(ClipboardItem {
+            entries: vec![image.clone()],
+        });
+        assert_eq!(pasteboard.read().expect("an image").entries, [image]);
     }
 
     #[test]
